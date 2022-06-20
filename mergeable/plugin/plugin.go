@@ -36,9 +36,9 @@ import (
 
 const (
 	// PluginName is the name of this plugin
-	PluginName         = "mergeable"
-	NeedMergeable      = "do-not-merge/non-mergeable"
-	needsRebaseMessage = "PR is not mergeable, get appropriate approvals."
+	PluginName          = "mergeable"
+	NeedMergeable       = "do-not-merge/non-mergeable"
+	notMergeableMessage = "PR is not mergeable."
 )
 
 var sleep = time.Sleep
@@ -46,10 +46,14 @@ var sleep = time.Sleep
 type githubClient interface {
 	GetIssueLabels(org, repo string, number int) ([]github.Label, error)
 	CreateCommentWithContext(ctx context.Context, org, repo string, number int, comment string) error
+	EditCommentWithContext(ctx context.Context, org, repo string, id int, comment string) error
+	ListIssueCommentsWithContext(ctx context.Context, org, repo string, number int) ([]github.IssueComment, error)
+	//DeleteComment(org, repo string, id int) error
 	BotUserChecker() (func(candidate string) bool, error)
 	AddLabelWithContext(ctx context.Context, org, repo string, number int, label string) error
 	RemoveLabelWithContext(ctx context.Context, org, repo string, number int, label string) error
 	IsMergeable(org, repo string, number int, sha string) (bool, error)
+	IsMergeableWithState(org, repo string, number int, sha string) (bool, *string, error)
 	DeleteStaleCommentsWithContext(ctx context.Context, org, repo string, number int, comments []github.IssueComment, isStale func(github.IssueComment) bool) error
 	QueryWithGitHubAppsSupport(ctx context.Context, q interface{}, vars map[string]interface{}, org string) error
 	GetPullRequest(org, repo string, number int) (*github.PullRequest, error)
@@ -121,7 +125,7 @@ func handle(log *logrus.Entry, ghc githubClient, pr *github.PullRequest) error {
 		"head-sha":          sha,
 	})
 
-	mergeable, err := ghc.IsMergeable(org, repo, number, sha)
+	mergeable, state, err := ghc.IsMergeableWithState(org, repo, number, sha)
 	if err != nil {
 		return err
 	}
@@ -130,7 +134,7 @@ func handle(log *logrus.Entry, ghc githubClient, pr *github.PullRequest) error {
 		return err
 	}
 	hasLabel := github.HasLabel(NeedMergeable, issueLabels)
-	return takeAction(ghc, org, repo, number, pr.User.Login, hasLabel, mergeable)
+	return takeAction(ghc, org, repo, number, pr.User.Login, hasLabel, mergeable, state)
 }
 
 const searchQueryPrefix = "archived:false is:pr is:open"
@@ -177,6 +181,7 @@ func HandleAll(log *logrus.Entry, ghc githubClient, config *plugins.Configuratio
 		org := string(pr.Repository.Owner.Login)
 		repo := string(pr.Repository.Name)
 		num := int(pr.Number)
+		mergeStateStatus := string(pr.MergeStateStatus)
 		var hasLabel bool
 		for _, label := range pr.Labels.Nodes {
 			if label.Name == NeedMergeable {
@@ -185,11 +190,12 @@ func HandleAll(log *logrus.Entry, ghc githubClient, config *plugins.Configuratio
 			}
 		}
 		l := log.WithFields(logrus.Fields{
-			"org":       org,
-			"repo":      repo,
-			"pr":        num,
-			"mergeable": pr.Mergeable,
-			"has_label": hasLabel,
+			"org":                org,
+			"repo":               repo,
+			"pr":                 num,
+			"mergeable":          pr.Mergeable,
+			"merge_state_status": mergeStateStatus,
+			"has_label":          hasLabel,
 		})
 		l.Debug("Processing PR")
 		err := takeAction(
@@ -200,6 +206,7 @@ func HandleAll(log *logrus.Entry, ghc githubClient, config *plugins.Configuratio
 			string(pr.Author.Login),
 			hasLabel,
 			pr.Mergeable == githubql.MergeableStateMergeable,
+			&mergeStateStatus,
 		)
 		if err != nil {
 			l.WithError(err).Error("Error handling PR.")
@@ -211,24 +218,32 @@ func HandleAll(log *logrus.Entry, ghc githubClient, config *plugins.Configuratio
 // takeAction adds or removes the "do-not-merge/non-mergeable" label based on the current
 // state of the PR (hasLabel and mergeable). It also handles adding and
 // removing GitHub comments notifying the PR author that a mergeable needed.
-func takeAction(ghc githubClient, org, repo string, num int, author string, hasLabel, mergeable bool) error {
+func takeAction(ghc githubClient, org, repo string, num int, author string, hasLabel, mergeable bool, state *string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	// Swallow context.DeadlineExceeded errors, they are expected to happen when we get throttled
-	if err := takeActionWithContext(ctx, ghc, org, repo, num, author, hasLabel, mergeable); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+	if err := takeActionWithContext(ctx, ghc, org, repo, num, author, hasLabel, mergeable, state); err != nil && !errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
 	return nil
 }
 
-func takeActionWithContext(ctx context.Context, ghc githubClient, org, repo string, num int, author string, hasLabel, mergeable bool) error {
-	if !mergeable && !hasLabel {
-		if err := ghc.AddLabelWithContext(ctx, org, repo, num, NeedMergeable); err != nil {
-			return fmt.Errorf("failed to add %q label: %w", NeedMergeable, err)
+func takeActionWithContext(ctx context.Context, ghc githubClient, org, repo string, num int, author string, hasLabel, mergeable bool, state *string) error {
+	if state != nil && *state != "" && *state != "HAS_HOOKS" && *state != "CLEAN" && *state != "UNSTABLE" {
+		mergeable = false
+	}
+	if !mergeable {
+		if !hasLabel {
+			if err := ghc.AddLabelWithContext(ctx, org, repo, num, NeedMergeable); err != nil {
+				return fmt.Errorf("failed to add %q label: %w", NeedMergeable, err)
+			}
 		}
-		msg := plugins.FormatSimpleResponse(author, needsRebaseMessage)
-		return ghc.CreateCommentWithContext(ctx, org, repo, num, msg)
+		reason := "The PR state is: "
+		if state != nil {
+			reason = reason + *state
+		}
+		return createOrUpdateComment(ctx, ghc, org, repo, num, author, reason)
 	} else if mergeable && hasLabel {
 		// remove label and prune comment
 		if err := ghc.RemoveLabelWithContext(ctx, org, repo, num, NeedMergeable); err != nil {
@@ -244,10 +259,41 @@ func takeActionWithContext(ctx context.Context, ghc githubClient, org, repo stri
 	return nil
 }
 
+func createOrUpdateComment(ctx context.Context, ghc githubClient, org string, repo string, num int, author string, reason string) error {
+	comments, err := ghc.ListIssueCommentsWithContext(ctx, org, repo, num)
+	if err != nil {
+		return fmt.Errorf("failed to list comments while createOrUpdate comment. err: %w", err)
+	}
+
+	botUserChecker, err := ghc.BotUserChecker()
+	if err != nil {
+		return err
+	}
+	needUpdate := func(comment github.IssueComment) bool {
+		return botUserChecker(comment.User.Login) &&
+			strings.Contains(comment.Body, notMergeableMessage)
+	}
+	updated := false
+	msg := plugins.FormatResponse(author, notMergeableMessage, reason)
+	for _, comment := range comments {
+		if needUpdate(comment) {
+			if err := ghc.EditCommentWithContext(ctx, org, repo, comment.ID, msg); err != nil {
+				return fmt.Errorf("failed to update the stale comment with ID '%d'", comment.ID)
+			}
+			updated = true
+		}
+	}
+	if !updated {
+		return ghc.CreateCommentWithContext(ctx, org, repo, num, msg)
+	} else {
+		return nil
+	}
+}
+
 func shouldPrune(isBot func(string) bool) func(github.IssueComment) bool {
 	return func(ic github.IssueComment) bool {
 		return isBot(ic.User.Login) &&
-			strings.Contains(ic.Body, needsRebaseMessage)
+			strings.Contains(ic.Body, notMergeableMessage)
 	}
 }
 
@@ -311,8 +357,9 @@ type pullRequest struct {
 			Name githubql.String
 		}
 	} `graphql:"labels(first:100)"`
-	Mergeable githubql.MergeableState
-	State     githubql.PullRequestState
+	Mergeable        githubql.MergeableState
+	MergeStateStatus githubql.String
+	State            githubql.PullRequestState
 }
 
 // See: https://developer.github.com/v4/query/.
