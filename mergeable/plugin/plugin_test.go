@@ -655,3 +655,42 @@ func TestCache(t *testing.T) {
 		}
 	}
 }
+
+func Test_isMergeable(t *testing.T) {
+	emptyState := ""
+	blockedState := "BLOCKED"
+	lowerBlockedState := "blocked"
+	tests := []struct {
+		name  string
+		state *string
+		want  bool
+	}{
+		{
+			name:  "nil state",
+			state: nil,
+			want:  true,
+		},
+		{
+			name:  "empty state",
+			state: &emptyState,
+			want:  true,
+		},
+		{
+			name:  "blocked state",
+			state: &blockedState,
+			want:  false,
+		},
+		{
+			name:  "lower blocked state",
+			state: &lowerBlockedState,
+			want:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isMergeable(tt.state); got != tt.want {
+				t.Errorf("isMergeable() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

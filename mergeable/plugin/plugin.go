@@ -229,8 +229,20 @@ func takeAction(ghc githubClient, org, repo string, num int, author string, hasL
 	return nil
 }
 
+func isMergeable(state *string) bool {
+	// returns true if state is nil or empty string
+	if state == nil || *state == "" {
+		return true
+	}
+	lstate := strings.ToLower(*state)
+	if lstate != "has_hooks" && lstate != "clean" && lstate != "unstable" {
+		return false
+	}
+	return true
+}
+
 func takeActionWithContext(ctx context.Context, ghc githubClient, org, repo string, num int, author string, hasLabel, mergeable bool, state *string) error {
-	if state != nil && *state != "" && *state != "HAS_HOOKS" && *state != "CLEAN" && *state != "UNSTABLE" {
+	if !isMergeable(state) {
 		mergeable = false
 	}
 	if !mergeable {
