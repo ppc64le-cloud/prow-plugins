@@ -7,7 +7,7 @@ toolchain go1.24.1
 require (
 	github.com/google/go-cmp v0.5.9
 	github.com/shurcooL/githubv4 v0.0.0-20210725200734-83ba7b4c9228
-	github.com/sirupsen/logrus v1.8.1
+	github.com/sirupsen/logrus v1.8.3
 	k8s.io/apimachinery v0.22.2
 	k8s.io/test-infra v0.0.0-20220602094746-10fd16a3e3a1
 )
